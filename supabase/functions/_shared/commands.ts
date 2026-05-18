@@ -8,7 +8,6 @@ import { handleListTrunk } from "./handlers/trunk.ts";
 import { getEventsInRange } from "./handlers/calendar.ts";
 import { formatInTimeZone } from "date-fns-tz";
 import type {
-  EventRow,
   IntentEnvelope,
   MemoryBubbleRow,
   OwnerRow,

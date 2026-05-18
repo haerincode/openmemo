@@ -1,5 +1,6 @@
 import { db, safeLog } from "./supabase.ts";
 import { computeNextTrigger, parseRRule, summarizeRRule } from "./rrule.ts";
+import { reinterpretUtcAsLocal } from "./tz.ts";
 import { embed } from "./deepseek.ts";
 import { sendEmailWithReason } from "./email.ts";
 import { geocode, getWeather } from "./weather.ts";
@@ -343,7 +344,7 @@ const TOOLS = [
     function: {
       name: "current_time",
       description:
-        "Obtén la hora ACTUAL del usuario en su zona, en este instante. Llama esta tool SIEMPRE que el usuario pregunte qué hora es, qué día es hoy, o necesites la hora exacta presente. NO uses la hora del turno anterior.",
+        "Obtén la hora ACTUAL del usuario en su zona, en este instante. Llama esta tool SIEMPRE que el usuario pregunte qué hora es, qué día es hoy, qué hora marca tu reloj interno, qué hora tienes tú, o necesites la hora exacta presente. La respuesta del tool YA ES la hora local del usuario; jamás la conviertas a UTC ni la presentes en otra zona. NO uses la hora del turno anterior.",
       parameters: { type: "object", properties: {} },
     },
   },
@@ -902,9 +903,10 @@ async function exec_create_reminder(
 ): Promise<unknown> {
   const title = String(args.title ?? "").trim();
   if (!title) return { error: "title is required" };
-  const triggerAt = typeof args.trigger_at === "string"
+  let triggerAt = typeof args.trigger_at === "string"
     ? args.trigger_at
     : null;
+  if (triggerAt) triggerAt = reinterpretUtcAsLocal(triggerAt, ctx.ownerTimezone);
   const rrule = typeof args.recurrence_rule === "string"
     ? args.recurrence_rule
     : null;
@@ -1139,14 +1141,17 @@ async function exec_add_pre_notifications(
   return { created, skipped };
 }
 
-async function exec_create_event(args: ToolArgs): Promise<unknown> {
+async function exec_create_event(args: ToolArgs, ctx: ToolCtx): Promise<unknown> {
   const title = String(args.title ?? "").trim();
-  const startsAt = String(args.starts_at ?? "");
+  let startsAt = String(args.starts_at ?? "");
   if (!title || !startsAt) return { error: "title and starts_at required" };
+  startsAt = reinterpretUtcAsLocal(startsAt, ctx.ownerTimezone);
   const startMs = Date.parse(startsAt);
   if (Number.isNaN(startMs)) return { error: "invalid starts_at" };
   const payload: Record<string, unknown> = { title, starts_at: startsAt };
-  if (typeof args.ends_at === "string") payload.ends_at = args.ends_at;
+  if (typeof args.ends_at === "string") {
+    payload.ends_at = reinterpretUtcAsLocal(args.ends_at, ctx.ownerTimezone);
+  }
   if (typeof args.location === "string") payload.location = args.location;
   if (typeof args.description === "string") {
     payload.description = args.description;
@@ -1354,14 +1359,11 @@ async function exec_current_time(
 }
 
 function postgrestEscape(value: string): string {
-  return value.replaceAll(/[,()*%]/g, " ").replaceAll(/\s+/g, " ").trim();
+  return value.replace(/[,()*%]/g, " ").replace(/\s+/g, " ").trim();
 }
 
 function ilikeEscape(value: string): string {
-  return value.replaceAll("\\", "\\\\").replaceAll("%", "\\%").replaceAll(
-    "_",
-    "\\_",
-  );
+  return value.replace(/\\/g, "\\\\").replace(/%/g, "\\%").replace(/_/g, "\\_");
 }
 
 function safeLimit(raw: unknown, fallback: number, max: number): number {
@@ -1832,7 +1834,7 @@ const TOOL_IMPL: Record<
   delete_reminders: (a) => exec_delete_reminders(a),
   update_reminder: (a) => exec_update_reminder(a),
   add_pre_notifications: exec_add_pre_notifications,
-  create_event: (a) => exec_create_event(a),
+  create_event: (a, c) => exec_create_event(a, c),
   list_events: (a) => exec_list_events(a),
   delete_events: (a) => exec_delete_events(a),
   create_note: (a) => exec_create_note(a),
@@ -2269,9 +2271,12 @@ function buildSystemPrompt(ctx: NlpContext, owner: OwnerRow): string {
     `2. Chains are fine: list_reminders -> delete_reminders with those ids.`,
     `3. "delete everything" -> delete_reminders with all=true. "delete the ones from monday" -> list first, then delete by id.`,
     `4. Never invent dates. If the user did not give a time, default to 12:00 only when the day is unambiguous; otherwise ask.`,
+    `4b. Words like "morning", "wake up", "al despertar", "noche", "before bed", "antes de dormir" map to the user's wake_time / bed_time. Look them up in owner_context first. If they are missing, ask once and persist with remember_about_user (key wake_time or bed_time, value HH:MM 24h). Never assume 06:00 or 22:00 by default.`,
     `5. For relative times ("in N minutes", "later") ALWAYS call current_time first; the reference timestamp can be a few seconds stale. For absolute dates the reference is fine.`,
-    `5b. trigger_at must always be ISO 8601 with the same numeric offset as the reference. If the reference is 2026-05-17T04:08:11-04:00 and the user says "in 5 minutes", return 2026-05-17T04:13:11-04:00. Never use Z or +00:00 unless the reference does.`,
+    `5b. trigger_at MUST use the user's local offset from the reference timestamp. If the reference is 2026-05-17T04:08:11-04:00, every trigger_at must end with -04:00 (or whatever offset the reference shows). Never emit Z, +00:00 or -00:00 unless the reference itself is in UTC. The system rejects UTC trigger_at when the user is not in UTC.`,
+    `5c. Hours in the chat are LOCAL. If the user says "20:00" treat it as 20:00 local, not UTC. Reply in the same local clock.`,
     `6. One create_reminder call per event. For multiple sub-minute pings, fire one create_reminder per exact time (RRULE handles minutes poorly).`,
+    `6b. Appointments with another person or place (medical, dental, government, flight, interview, school) MUST be created as both create_reminder (so it pings) AND create_event (so it shows in the calendar and blocks the slot). One without the other is a bug.`,
     `7. Use the memory tools to save tokens long term:`,
     `   - When the user shares a fact about themselves (routine, preference, family, work, health, recurring places), call remember_about_user with a short stable key. Reuse it next time instead of asking again.`,
     `   - Before answering "what do you know about me" call list_memories.`,
@@ -2295,7 +2300,9 @@ function buildSystemPrompt(ctx: NlpContext, owner: OwnerRow): string {
     `9d. Never name timezones, countries or cities the user lives in. Never say "your profile", "the system", "according to your data". If asked the time, just answer "It's HH:MM".`,
     `10. If a tool returns an error, explain it naturally and move on. Do not retry the same call.`,
     `11. Pure chit-chat ("hi", "thanks") needs no tools.`,
-    `12. For "what time is it" or "what day is today" always call current_time.`,
+    `12. For "what time is it", "what day is today", "qué hora marca tu reloj interno", "qué hora tienes tú", "tu hora", always call current_time and report time_hhmm exactly as returned. The tool already returns local time; never recompute or mention UTC.`,
+    `13. Confirmation is one-shot. If the user said yes / sí / dale / ok / confirmo to a pending action in the previous turn, EXECUTE it now. Do not ask the same confirmation again. If the user said no / cancela, drop it silently.`,
+    `14. Always speak in local clock to the user. Never mention UTC, offsets, timezones, "mi reloj interno está en UTC", "según mi sistema", or "according to my data". You do not have a separate internal clock; you read the user's clock through current_time. If you list times, format them HH:MM in the user's local time only.`,
     ``,
     `Date format: ISO 8601 with the user's offset (e.g. 2026-09-09T09:00:00+02:00).`,
   ].join("\n");
